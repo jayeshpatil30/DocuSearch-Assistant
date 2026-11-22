@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SpecSafe Document Search - index jobs for the TENANT_A and TENANT_B Atlas collections, all from
+  one container image. Event-driven: S3 Object Created/Deleted events (EventBridge) and
+  SpecSafe "document changed" calls (IAM-authenticated Function URL) go through the
+  index-events SQS queue to a worker that indexes, updates or purges each document.
+  Deploy in the source bucket's region (S3 sends its events to that region's EventBridge).
+  Safety net: a daily DeleteMark=1 purge.
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image built from deploy/index-jobs/Dockerfile (repo@sha256:... or repo:tag).
+  MongoUri:
+    Type: String
+    NoEcho: true
+    Description: >
+      Atlas connection string (mongodb+srv://...), set as the functions' SEARCH_MONGO_URI.
+      Needs read on the catalogue (AttachmentMetaData) and read/write on
+      OB_DOCUMENTSEARCH_<ENV>. NoEcho: not shown in the console or stack descriptions.
+  IndexMongoDatabase:
+    Type: String
+    Default: DOCSEARCH_DEMO
+  DgCollection:
+    Type: String
+    Default: TENANT_A_DocumentSearch_DEV
+  DgMetadataDatabase:
+    Type: String
+    Default: TENANT_A_DEV
+  BeeCollection:
+    Type: String
+    Default: TENANT_B_DocumentSearch_DEV
+  BeeMetadataDatabase:
+    Type: String
+    Default: TENANT_B_DEV
+  SourceBucketArns:
+    Type: CommaDelimitedList
+    Description: ARNs of the bucket(s) the documents live in, e.g. arn:aws:s3:::demo-deployment-TENANT_A-bedrock
+  SourceBucketNames:
+    Type: CommaDelimitedList
+    Description: >
+      The same bucket(s) by name, e.g. demo-deployment-TENANT_A-bedrock -- the S3 events rule
+      matches on names. Each needs "Send notifications to Amazon EventBridge" turned on
+      (bucket Properties > Event notifications); nothing else about the bucket changes.
+  SpecSafePrincipalArn:
+    Type: String
+    Description: >
+      IAM user (or role) ARN SpecSafe signs its "document changed" calls with -- the
+      Document Search service account, e.g. arn:aws:iam::123456789012:user/docsearch-service.
+  EventsMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 100
+    Description: >
+      Most workers syncing documents at once. Caps the load on Bedrock (Titan),
+      Textract and Atlas when many files arrive together; the rest wait in the queue.
+  PurgeSchedule:
+    Type: String
+    Default: cron(0 2 * * ? *)
+    Description: When to purge DeleteMark=1 documents (UTC). Default daily 02:00.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: The daily DeleteMark purge (a safety net behind SpecSafe's calls).
+  EventsState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: The S3 object events rule. DISABLED stops indexing on upload.
+  RecordWaitMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    Description: >
+      How long a file uploaded before its AttachmentMetaData record is kept (embedded,
+      invisible) and re-checked; then it is removed until SpecSafe's call re-adds it.
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: >
+      Region of the Titan embedding model the collections were built with (and the LLM).
+      Must match the existing vectors' model; it need not be the stack's region.
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+    Description: CPU architecture the image was built for.
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 60, 90, 120, 180, 365, 731]
+  IndexTargetsJson:
+    Type: String
+    Default: ""
+    Description: >
+      Optional INDEX_TARGETS override (JSON). Blank = the TENANT_A and TENANT_B targets built from
+      the collection parameters above.
+  OcrProvider:
+    Type: String
+    Default: textract
+    AllowedValues: [textract, none]
+    Description: OCR for scanned PDFs. 'none' indexes native text only.
+  LlmModel:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: Bedrock model/inference profile for supplier-name extraction.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Private subnets (with a NAT gateway or VPC endpoints for S3, Bedrock, Textract,
+      SQS) when Atlas is reached over a VPC/PrivateLink or a NAT static IP
+      on the Atlas access list. Leave blank to run outside a VPC.
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional. Blank = the stack creates its own security group (outbound only, no
+      inbound) in VpcId.
+  VpcId:
+    Type: String
+    Default: ""
+    Description: >
+      The VPC of SubnetIds (e.g. example-vpc). Required with SubnetIds unless
+      SecurityGroupIds is given.
+
+Conditions:
+  InVpc: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+  CustomSecurityGroups: !Not [!Equals [!Join ["", !Ref SecurityGroupIds], ""]]
+  OwnSecurityGroup: !And [!Condition InVpc, !Not [!Condition CustomSecurityGroups]]
+  CustomTargets: !Not [!Equals [!Ref IndexTargetsJson, ""]]
+
+Resources:
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - InVpc
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: index-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListSourceBuckets
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Ref SourceBucketArns
+              - Sid: ReadSourceDocuments
+                Effect: Allow
+                Action: s3:GetObject
+                # ["arn:...:a", "arn:...:b"] -> ["arn:...:a/*", "arn:...:b/*"]
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "${Joined}/*"
+                    - Joined: !Join ["/*,", !Ref SourceBucketArns]
+              - Sid: Embed
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/*
+                  - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Sid: Ocr
+                Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                  - textract:DetectDocumentText
+                  # scanned PDFs: asynchronous jobs against the S3 object (ocr_pdf)
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                Resource: "*"
+              - Sid: ConsumeIndexEvents
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                  - sqs:SendMessage # delayed re-checks of files awaiting their record
+                Resource: !GetAtt IndexEventsQueue.Arn
+
+  # Outbound only: the functions open connections (Atlas, S3, SQS, Bedrock, Textract)
+  # through the VPC's NAT and accept none.
+  FunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: OwnSecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AWS::StackName} index Lambdas - outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Atlas, S3, SQS, Bedrock, Textract via the NAT gateway
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-index-lambdas" }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-index-jobs
+      RetentionInDays: !Ref LogRetentionDays
+
+  IndexJobsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-index-jobs
+      Description: Daily DeleteMark purge (and manual index/sync runs) for the Document Search collections
+      PackageType: Image
+      Code: { ImageUri: !Ref ImageUri }
+      Architectures: [!Ref Architecture]
+      Role: !GetAtt FunctionRole.Arn
+      # The handler stops starting new documents ~2 minutes before this and leaves
+      # the rest for the next run, so the timeout never cuts a write in half.
+      Timeout: 900
+      MemorySize: 3008
+      EphemeralStorage: { Size: 2048 }
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !If
+            - CustomSecurityGroups
+            - !Ref SecurityGroupIds
+            - [!Ref FunctionSecurityGroup]
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          SEARCH_MONGO_URI: !Ref MongoUri
+          INDEX_TARGETS: !If
+            - CustomTargets
+            - !Ref IndexTargetsJson
+            - !Sub
+              - '{"TENANT_A": {"collection": "${DgCollection}", "metadata_database": "${DgMetadataDatabase}"}, "TENANT_B": {"collection": "${BeeCollection}", "metadata_database": "${BeeMetadataDatabase}"}}'
+              - {}
+          SEARCH_INDEX_MONGO_DATABASE: !Ref IndexMongoDatabase
+          SEARCH_MONGO_COLLECTION: AttachmentMetaData
+          SEARCH_STORE_BACKEND: mongo
+          SEARCH_DATA_DIR: /tmp/search
+          AWS__REGION: !Ref AWS::Region
+          BEDROCK__REGION: !Ref BedrockRegion
+          BEDROCK__LLM_MODEL: !Ref LlmModel
+          PROCESSING_OCR_PROVIDER: !Ref OcrProvider
+          # Above Textract's own 300 s polling limit, so a scanned PDF is not cut off.
+          SEARCH_DOC_TIMEOUT_S: "360"
+          INDEX_INITIAL_LOOKBACK_H: "24"
+          INDEX_RECORD_WAIT_MIN: !Ref RecordWaitMinutes
+          LOG_LEVEL: INFO
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-index-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt IndexJobsFunction.Arn
+
+  # No retries: a failed purge is simply repeated by the next one.
+  PurgeDgSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${AWS::StackName}-purge-TENANT_A
+      Description: Remove TENANT_A documents soft-deleted upstream (DeleteMark=1)
+      ScheduleExpression: !Ref PurgeSchedule
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt IndexJobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"job": "purge", "target": "TENANT_A"}'
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  PurgeBeeSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${AWS::StackName}-purge-TENANT_B
+      Description: Remove TENANT_B documents soft-deleted upstream (DeleteMark=1)
+      ScheduleExpression: !Ref PurgeSchedule
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt IndexJobsFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"job": "purge", "target": "TENANT_B"}'
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-index-jobs-errors
+      AlarmDescription: An index job failed (see the function's logs)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref IndexJobsFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ------------------------------------------------------------------------
+  # Event-driven sync: S3 events + SpecSafe calls -> index-events -> worker
+  # ------------------------------------------------------------------------
+
+  IndexEventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-index-events-dlq
+      MessageRetentionPeriod: 1209600 # 14 days to inspect and redrive
+      SqsManagedSseEnabled: true
+
+  IndexEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-index-events
+      # 6 x the worker's timeout (AWS guidance for Lambda consumers). Messages to
+      # retry (document busy, out of time, failed) are brought back after 60 s by the
+      # worker itself, so this only applies when a whole invocation dies.
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IndexEventsDlq.Arn
+        maxReceiveCount: 5
+
+  S3ObjectEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-s3-object-events
+      Description: New, replaced and removed source documents -> index-events
+      State: !Ref EventsState
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created, Object Deleted]
+        detail:
+          bucket:
+            name: !Ref SourceBucketNames
+      Targets:
+        - Id: index-events
+          Arn: !GetAtt IndexEventsQueue.Arn
+
+  IndexEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IndexEventsQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3EventsFromEventBridge
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt IndexEventsQueue.Arn
+            Condition:
+              ArnEquals: { aws:SourceArn: !GetAtt S3ObjectEventsRule.Arn }
+
+  IndexEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-index-events
+      RetentionInDays: !Ref LogRetentionDays
+
+  IndexEventsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IndexEventsLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-index-events
+      Description: Syncs each document named by an S3 event or a SpecSafe call
+      PackageType: Image
+      Code: { ImageUri: !Ref ImageUri }
+      ImageConfig:
+        Command: [rag_search.index_jobs.sqs_handler]
+      Architectures: [!Ref Architecture]
+      Role: !GetAtt FunctionRole.Arn
+      # Up to 5 documents per batch, each up to SEARCH_DOC_TIMEOUT_S (OCR); documents
+      # not started before the deadline are handed back to the queue, never cut off.
+      # The queue's visibility timeout (1800 s) must stay above this.
+      Timeout: 900
+      MemorySize: 3008
+      EphemeralStorage: { Size: 2048 }
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !If
+            - CustomSecurityGroups
+            - !Ref SecurityGroupIds
+            - [!Ref FunctionSecurityGroup]
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          SEARCH_MONGO_URI: !Ref MongoUri
+          INDEX_TARGETS: !If
+            - CustomTargets
+            - !Ref IndexTargetsJson
+            - !Sub
+              - '{"TENANT_A": {"collection": "${DgCollection}", "metadata_database": "${DgMetadataDatabase}"}, "TENANT_B": {"collection": "${BeeCollection}", "metadata_database": "${BeeMetadataDatabase}"}}'
+              - {}
+          INDEX_EVENTS_QUEUE_URL: !Ref IndexEventsQueue
+          SEARCH_INDEX_MONGO_DATABASE: !Ref IndexMongoDatabase
+          SEARCH_MONGO_COLLECTION: AttachmentMetaData
+          SEARCH_STORE_BACKEND: mongo
+          SEARCH_DATA_DIR: /tmp/search
+          AWS__REGION: !Ref AWS::Region
+          BEDROCK__REGION: !Ref BedrockRegion
+          BEDROCK__LLM_MODEL: !Ref LlmModel
+          PROCESSING_OCR_PROVIDER: !Ref OcrProvider
+          # Above Textract's own 300 s polling limit, so a scanned PDF is not cut off.
+          SEARCH_DOC_TIMEOUT_S: "360"
+          INDEX_RECORD_WAIT_MIN: !Ref RecordWaitMinutes
+          LOG_LEVEL: INFO
+
+  IndexEventsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IndexEventsQueue.Arn
+      FunctionName: !Ref IndexEventsFunction
+      BatchSize: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: !Ref EventsMaxConcurrency
+
+  IndexEventsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-index-events-errors
+      AlarmDescription: >
+        The indexing worker crashed (e.g. Atlas unreachable); see the index-events logs
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref IndexEventsFunction }]
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  IndexEventsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-index-events-dead-letters
+      AlarmDescription: >
+        A document could not be synced after 5 attempts (see the index-events logs;
+        redrive the DLQ once fixed)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt IndexEventsDlq.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # SpecSafe's "document changed" endpoint: validates and queues, nothing more, so it
+  # needs no Atlas, S3 or Bedrock access.
+  SyncApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: queue-index-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IndexEventsQueue.Arn
+
+  SyncApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-sync-api
+      RetentionInDays: !Ref LogRetentionDays
+
+  SyncApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SyncApiLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-sync-api
+      Description: SpecSafe "document changed" endpoint (queues documents to sync)
+      PackageType: Image
+      Code: { ImageUri: !Ref ImageUri }
+      ImageConfig:
+        Command: [rag_search.sync_api.api_handler]
+      Architectures: [!Ref Architecture]
+      Role: !GetAtt SyncApiRole.Arn
+      Timeout: 30
+      MemorySize: 1024
+      Environment:
+        Variables:
+          INDEX_TARGETS: !If
+            - CustomTargets
+            - !Ref IndexTargetsJson
+            - !Sub
+              - '{"TENANT_A": {"collection": "${DgCollection}"}, "TENANT_B": {"collection": "${BeeCollection}"}}'
+              - {}
+          INDEX_EVENTS_QUEUE_URL: !Ref IndexEventsQueue
+          LOG_LEVEL: INFO
+
+  SyncApiUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt SyncApiFunction.Arn
+      AuthType: AWS_IAM
+
+  # Both are granted so the IAM-authenticated URL works whichever of Lambda's
+  # permission checks the account applies to function URLs.
+  SyncApiUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SyncApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: !Ref SpecSafePrincipalArn
+      FunctionUrlAuthType: AWS_IAM
+
+  SyncApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SyncApiFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref SpecSafePrincipalArn
+
+Outputs:
+  FunctionName:
+    Value: !Ref IndexJobsFunction
+  FunctionArn:
+    Value: !GetAtt IndexJobsFunction.Arn
+  SyncApiUrl:
+    Description: The URL SpecSafe POSTs "document changed" calls to (SigV4, service "lambda")
+    Value: !GetAtt SyncApiUrl.FunctionUrl
+  IndexEventsQueueUrl:
+    Value: !Ref IndexEventsQueue
+  IndexEventsDlqUrl:
+    Value: !Ref IndexEventsDlq
